@@ -281,7 +281,7 @@ write_symbol_to_db(Type, Name, Node, S=#state{entries = Entries}) when length(Na
 		{StartPos, L1} =
 		 if (LineNo =/= S#state.line_no) ->
 	 			% we have moved to new line, complete the old line
-		     	% and write the new line number
+				% and write the new line number
 				OldLine = if S#state.line_no > 0 ->
 					binary_to_list(array:get(S#state.line_no-1, S#state.data));
 					true -> ""
