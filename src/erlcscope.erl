@@ -99,9 +99,11 @@ build_symbol_db_from_file(SrcFile) ->
 	State = #state{data=array:from_list(Lines)},
 	NewState = write_symbol_to_db(?FILE_MARK, SrcFile, 0, State),
 	{ok, ParseTree} = epp_dodger:parse_file(SrcFile),
+	%% We need the module name to add a module qualifier to function definitions.
+	Module = filename:basename(SrcFile, ".erl"),
 	%io:format("~p",[ParseTree]),
 	try
-	    traverse_tree([ParseTree],NewState)
+	    traverse_tree(Module, [ParseTree],NewState)
 	catch
 	    E:R ->
 		%% rethrow the exception
@@ -115,7 +117,7 @@ build_symbol_db_from_file(SrcFile) ->
 		erlang:raise(E, R, {srcfile,SrcFile})
 	end.
 
-traverse_tree(TreeList, S=#state{}) ->
+traverse_tree(Module, TreeList, S=#state{}) ->
 	lists:foldl(
 	fun(NodeList,S2) ->
 		lists:foldl(fun(Node,State) ->
@@ -123,12 +125,12 @@ traverse_tree(TreeList, S=#state{}) ->
 			{NewNode, NewState} = case erl_syntax:type(Node) of
 				  application -> process_application(Node, State);
 				  atom -> process_atom(Node, State);
-				  attribute -> process_attribute(Node,State);
-				  function -> process_function(Node,State);
+				  attribute -> process_attribute(Module, Node,State);
+				  function -> process_function(Module, Node,State);
 				  variable -> process_variable(Node,State);
 				  _ -> {erl_syntax:subtrees(Node), State}
 			  end,
-			  traverse_tree(NewNode,NewState)
+			  traverse_tree(Module, NewNode,NewState)
     	end, S2, NodeList)
 	end, S, TreeList).
 
@@ -171,46 +173,54 @@ process_atom(Node, S=#state{}) ->
 	end.
 
 
-process_attribute(Node,S=#state{}) ->
+process_attribute(Module, Node,S=#state{}) ->
 	%io:format("node ~p~n",[Node]),
 	%io:format("attr name ~p~n",[erl_syntax:atom_value(erl_syntax:attribute_name(Node))]),
 	Type = erl_syntax:atom_value(erl_syntax:attribute_name(Node)),
 	case Type of
 		define ->
-			process_define(Node,S);
+			process_define(Module, Node,S);
 		record ->
 			process_record(Node,S);
 		_ ->
 			{[],S}
 	end.
 
-process_define(Node,S=#state{}) ->
+process_define(Module, Node,S=#state{}) ->
 	%io:format("subtree ~p~n",[erl_syntax:attribute_arguments(Node)]),
 	[Def | Subtree] = erl_syntax:attribute_arguments(Node),
 	Name = get_define_name(Def),
 	%io:format("name ~p len ~p pos ~p~n",[Name,length(Name), erl_syntax:get_pos(Def)]),
 	NewState1 = write_symbol_to_db(?MACRO_MARK, Name, Def, S),
-	NewState2 = traverse_tree([Subtree], NewState1),
+	NewState2 = traverse_tree(Module, [Subtree], NewState1),
 	NewState3 = write_symbol_to_db(?MACRO_END_MARK, "" , Node, NewState2),
 	{[],NewState3}.
 
-process_function(Node, S=#state{}) ->
+process_function(Module, Node, S=#state{}) ->
 	try erl_syntax_lib:analyze_function(Node) of
 		{'', _FArity} ->
 			output_stderr("Ignoring function with name ''\n"),
 			{[],S};
 		{FAtom, _FArity} ->
 			Fname = atom_to_list(FAtom),
-		 	%io:format("function ~s~n",[Fname]),
-			NewState1 = write_symbol_to_db(?FUNCTION_DEF_MARK, Fname, Node, S),
-			[_FuncTree, ClauseTree ]=  erl_syntax:subtrees(Node),
-			NewState2 = traverse_tree([ClauseTree], NewState1),
-			NewState3 = write_symbol_to_db(?FUNCTION_END_MARK, "", Node, NewState2),
-	        {[], NewState3}
+			QualifiedFname = lists:flatten(io_lib:format("~s:~s", [Module, Fname])),
+			NewState1 = write_function_to_db(Module, Fname, Node, S),
+			NewState2 = write_function_to_db_no_traverse(QualifiedFname, Node, NewState1),
+			{[], NewState2}
 	catch
 		syntax_error ->
 			{[], S}
 	end.
+
+write_function_to_db(Module, Fname, Node, S) ->
+	NewState1 = write_symbol_to_db(?FUNCTION_DEF_MARK, Fname, Node, S),
+	[_FuncTree, ClauseTree ]=  erl_syntax:subtrees(Node),
+	NewState2 = traverse_tree(Module, [ClauseTree], NewState1),
+	write_symbol_to_db(?FUNCTION_END_MARK, "", Node, NewState2).
+
+write_function_to_db_no_traverse(Fname, Node, S) ->
+	NewState1 = write_symbol_to_db(?FUNCTION_DEF_MARK, Fname, Node, S),
+	write_symbol_to_db(?FUNCTION_END_MARK, "", Node, NewState1).
 
 
 process_record(Node, S=#state{}) ->
@@ -274,7 +284,12 @@ write_symbol_to_db(Type, Name, Node, S=#state{entries = Entries}) when length(Na
 		true -> S#state.pos;
 		false -> 1 % new line, start from pos 1
 	end,
-	FoundLen = string:str( string:sub_string(Line, SearchPos), Name),
+	%% If the name includes the module, strip the module name
+	StrippedName = case string:tokens(Name, [$:]) of
+			   [Name] -> Name;
+			   [_Module,Name1] -> Name1
+		       end,
+	FoundLen = string:str(string:sub_string(Line, SearchPos), StrippedName),
 	%io:format("fount ~p at ~p~n",[Name,FoundLen]),
 	case FoundLen > 0 of
 	   true ->
@@ -298,7 +313,11 @@ write_symbol_to_db(Type, Name, Node, S=#state{entries = Entries}) when length(Na
 		 L2 = f("~s~n",[NonSymbolData]),
 		 % write symbol data
 		 L3 = f("~s~s~n",[Type,Name]),
-		 S#state{line_no=LineNo, pos=EndPos + length(Name), entries = [lists:flatten([L1, L2, L3]) | Entries]};
+		 S#state{
+		     line_no=LineNo,
+		     pos=EndPos + length(StrippedName),
+		     entries = [lists:flatten([L1, L2, L3]) | Entries]
+		 };
 	  false -> % cannot find this name
 		 S
 	end; % Foundlen > 0
